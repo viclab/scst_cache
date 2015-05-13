@@ -3018,13 +3018,23 @@ static void blockio_endio_read(struct bio *bio, int error)
         spin_unlock_irqrestore(&blockio_endio_lock, flags);
     }
 
+    //将数据从Cache拷贝到sg中
     struct scatterlist *sg = blockio_work->sgl;
     struct bio_vec *bvec;
-    int i;
+    int i, bytes, off = 0;
     bio_for_each_segment(bvec, bio, i) {
-        struct page *pg = bvec[i].bv_page;
-        memcpy(page_address((sg+i)->page), 
-                page_address(pg) + blockio_work->off, blockio_work->len);
+        memcpy(page_address(sg->page) + sg->offset + off, page_address(bvec->bv_page) + bv_offset, bv_len);
+        off += bv_len;
+        //struct page *pg = bvec[i].bv_page;
+        //bytes = min_t(unsigned int, sg->length, PAGE_SIZE - blockio_work->off);
+        //memcpy(page_address(sg->page) + sg->offset, 
+        //        page_address(pg) + blockio_work->off, bytes);
+        //if (bytes < sg->length)
+        //{
+        //    
+        //    memcpy(page_address(sg->page) + sg->offset + bytes,
+        //            page_address(pg), 
+        //}
     }
 
     blockio_check_finish(blockio_work);
@@ -3327,6 +3337,7 @@ static void blockio_exec_read(struct scst_cmd *cmd, struct scst_vdisk_thr *thr,
                     bio->bi_bdev = bdev;
                     bio->bi_private = blockio_work;
 
+                    block_work->sgl = cmd->sg[cmd->get_sg_buf_entry_num - 1];
                     block_work->off = cache_offset << SECTOR_SIZE;
                     block_work->len = length;        
                     /*
