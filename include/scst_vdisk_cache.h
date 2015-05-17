@@ -1,13 +1,11 @@
 /*
-*  write by yw_raid,
-*  use the static to avoid conflict with kernel tree
-*  1.lru list operation
-*  2.modify __maxindex()`s return type to unsigned long long
-*  3.ignore type conversion for unsigned long long to unsigned long
-*  4.modify cache_radix_tree_maxindex()`s return type to unsigned long long
-*  5.max_path is 0~11,there is a array to record the conversion for 
-*    max_index and height.in fact 0~6 is enough, this point should be
-*    discussed.
+*  write by vic,
+*  本文件用途：
+*  		1. 定义基树结构及其操作
+* 		2. 定义lru双向链表及其操作
+* 		3. Cache块数据结构定义
+* 		4. Cache相关参数定义
+*  
 */
 
 #include <linux/sched.h>
@@ -37,7 +35,13 @@
 #define SECTOR_SHIFT  9
 #endif
 
+#ifndef ZONE_SHIFT
+#define ZONE_SHIFT  22
+#endif
+
 #define SECTS_OF_PAGE  (PAGE_SIZE >> SECTOR_SHIFT)
+
+#define PAGES_OF_ZONE 	(1 << (ZONE_SHIFT - PAGE_SHIFT))
 
 #define CACHE_RADIX_TREE_MAX_TAGS 2
 
@@ -58,15 +62,11 @@
 
 struct vdisk_dev_cache
 {
-	u32 read_cache_status;
-	u32 write_cache_status;
-	atomic_t read_cache_count ;
-	atomic_t write_cache_count;
-	struct list_head *read_cache_list_head;
-    struct list_head *write_cache_list_head;
+	u32 cache_status;
+	atomic_t cache_count ;
+	struct list_head *cache_list_head;
     struct mutex flushio_lock;
-    rwlock_t read_list_lock;
-    rwlock_t write_list_lock;
+    rwlock_t list_lock;
     rwlock_t radix_tree_lock;
 	struct cache_radix_tree_root *dev_cache_tree_root;	
 };
@@ -81,7 +81,16 @@ struct __vdisk_cache
 };
 typedef struct __vdisk_cache vdisk_cache;
 
+struct __cache_zone
+{
+	spinlock_t zone_lock;
+	int freq;
+	struct list_head lru_list;
+};
+typedef struct __cache_zone cache_zone;
+
 struct cache_radix_tree_root {
+	int freq; 					//频度或优先级值
 	unsigned int		height;
 	gfp_t			gfp_mask;
 	struct cache_radix_tree_node	*rnode;
@@ -151,6 +160,7 @@ void *delete_cache_in_tree(struct cache_radix_tree_root *root, unsigned long ind
 void *cache_radix_tree_tag_set(struct cache_radix_tree_root *root, unsigned long index, unsigned int tag);
 int insert_cache_in_tree(struct cache_radix_tree_root *root, unsigned long index, void *item);
 vdisk_cache *lookup_cache_in_tree(struct cache_radix_tree_root *root,  unsigned long index);
+vdisk_cache *lookup_min_in_tree(struct cache_radix_tree_root *root);
 struct cache_radix_tree_node *lookup_node_in_tree(struct cache_radix_tree_root *root, unsigned long index);
 void cache_radix_tree_init(void);
 void cache_radix_tree_destory(void);
@@ -360,6 +370,43 @@ static inline void **__lookup_slot(struct cache_radix_tree_root *root,
 	return (void **)slot;
 }
 
+//基树上查找最小值的叶子节点
+static inline void **__lookup_slot_min(struct cache_radix_tree_root *root)
+{
+	unsigned int height, shift;
+	struct cache_radix_tree_node **slot, **min;
+
+	height = root->height;
+
+	if (index > cache_radix_tree_maxindex(height))
+		return NULL;
+
+	if (height == 0 && root->rnode)
+		return (void **)&root->rnode;
+
+	slot = &root->rnode;
+
+	while (height > 0) {
+		if (*slot == NULL)
+			return NULL;
+		
+		struct cache_radix_tree_node ** temp, **base;
+		base = (struct cache_radix_tree_node **) ((*slot)->slots);
+		min = temp = base;
+		while (temp != base + CACHE_RADIX_TREE_MAP_SIZE)
+		{
+			if (!temp && (*temp)->freq < (*min)->freq)
+				min = temp;
+		}
+		
+	slot = (*min)->slots;
+
+	height--;
+	}
+
+	return (void **)slot;
+}
+
 static inline void ** __lookup_node(struct cache_radix_tree_root * root, unsigned long index)
 {
 	unsigned int height, shift;
@@ -403,8 +450,6 @@ static void *cache_radix_tree_lookup(struct cache_radix_tree_root *root, unsigne
 	slot = __lookup_slot(root, index);
 	return slot != NULL ? *slot : NULL;
 }
-
-
 
 static int cache_radix_tree_extend(struct cache_radix_tree_root *root, unsigned long index)
 {
@@ -684,6 +729,14 @@ vdisk_cache *lookup_cache_in_tree(struct cache_radix_tree_root *root,
 	cachep = cache_radix_tree_lookup(root,index);
 	return cachep;
 }
+
+vdisk_cache *lookup_min_in_tree(struct cache_radix_tree_root *root)
+{
+	vdisk_cache *cachep;
+	cachep = __lookup_slot_min(root);
+	return cachep;
+}
+
 struct cache_radix_tree_node *lookup_node_in_tree(struct cache_radix_tree_root *root, unsigned long index)
 {
 	struct cache_radix_tree_node *node;
