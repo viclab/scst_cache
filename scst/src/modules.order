@@ -1,0 +1,10 @@
+kernel//root/Desktop/scst-2.2.0/src/scst.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_cdrom.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_changer.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_disk.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_modisk.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_tape.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_vdisk.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_raid.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_processor.ko
+kernel//root/Desktop/scst-2.2.0/src/dev_handlers/scst_user.ko
