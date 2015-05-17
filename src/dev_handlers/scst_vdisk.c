@@ -1076,7 +1076,9 @@ static int vdisk_do_job(struct scst_cmd *cmd)
         case WRITE_16:
             {
                 if (virt_dev->blockio) {
-                    blockio_exec_rw(cmd, thr, lba_start, 1);
+                    //blockio_exec_rw(cmd, thr, lba_start, 1);
+                    //added by vic
+                    blockio_exec_write(cmd, thr, lba_start, 0);
                     goto out_thr;
                 } else
                     vdisk_exec_write(cmd, thr, loff);
@@ -3208,6 +3210,259 @@ out_no_mem:
 static void blockio_exec_read(struct scst_cmd *cmd, struct scst_vdisk_thr *thr,
         u64 lba_start, int write)
 {
+    //解析cmd中I/O类别
+    uint8_t *cdb = cmd->cdb;
+    int classifyid = cdb[6];
+    //如果是元数据，则由元数据Cache处理
+    //否则有数据Cache处理
+    switch(classifyid)
+    {
+        case META_INODE:   
+        case META_DIR:
+        case META_JOURNAL:
+            blockio_meta_read(cmd, thr, write);
+            break;
+        case DATE_FILE:
+            blockio_data_read(cmd, thr, write);
+            break;
+    }
+}
+
+//added by vic
+//处理元数据Cache读请求
+static void blockio_meta_read(struct scst_cmd *cmd, struct scst_vdisk_thr *thr,
+        u64 lba_start, int write)
+{
+    //1.计算Cache块地址lba_align并在基树上进行检索
+    //2.如果命中，拷贝Cache块数据
+    //3.如果不命中，构造bio入bio链
+    struct scst_vdisk_dev *virt_dev = cmd->dev->dh_priv;
+    struct block_device *bdev = thr->bdev;
+    struct request_queue *q = bdev_get_queue(bdev);
+    int length, max_nr_vecs = 0, offset;
+    struct page *page;
+    struct bio *bio = NULL, *hbio = NULL, *tbio = NULL;
+    int need_new_bio;
+    struct scst_blockio_work *blockio_work;
+    int bios = 0;
+    gfp_t gfp_mask = (cmd->noio_mem_alloc ? GFP_NOIO : GFP_KERNEL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+    struct blk_plug plug;
+#endif
+
+    TRACE_ENTRY();
+
+    if (virt_dev->nullio)
+        goto out;
+
+    /* Allocate and initialize blockio_work struct */
+    blockio_work = kmem_cache_alloc(blockio_work_cachep, gfp_mask);
+    if (blockio_work == NULL)
+        goto out_no_mem;
+
+    blockio_work->cmd = cmd;
+
+    if (q)
+        max_nr_vecs = min(bio_get_nr_vecs(bdev), BIO_MAX_PAGES);
+    else
+        max_nr_vecs = 1;
+
+
+    length = scst_get_sg_page_first(cmd, &page, &offset);
+    while (length > 0) {
+        int len, bytes, off, thislen;
+        struct page *pg;
+        u64 lba_start0;
+        u32 lba_align, cache_offset;        //Cache块地址lba_align及块内偏移cache_offset
+                                            //这两个变量很重要，将在readio_work中用到
+
+        pg = page;
+        len = length;
+        off = offset;
+        //thislen = 0;
+        lba_start0 = lba_start;
+
+        while (len > 0) {
+            int rc;
+
+            //基树上检索
+            lba_align = lba_start0 >> SECTS_OF_PAGE;
+            cache_offset = lba_start0 & (SECTS_OF_PAGE - 1);
+            write_lock_irq(&radix_tree_lock);
+            cache_hitted = lookup_cache_in_tree(cache_tree_root, lba_align);
+            write_unlock_irq(&radix_tree_lock);
+
+            if (cache_hitted && !test_bit(CACHE_LOCKED, &cache_hitted->cache_flags))
+            {
+                memcpy(page_address(pg), page_address(cache_hitted->page) 
+                        + (lba_offset >> SECTOR_SIZE), len);
+            }
+            else
+            {
+                need_new_bio = 1;
+
+                //先判断Cache是否满
+                //满则置换，未满则直接新增Cache
+                if (is_cache_full(cache_size))
+                {
+                    write_lock_irq(&radix_tree_lock);
+                    radix_tree_node * cache_replace = lookup_min_in_tree(cache_tree_root);
+                    delete_cache_in_tree(cache_tree_root, cache_replace->lba_align);
+                    write_unlock_irq(&radix_tree_lock);
+
+                    set_bit(CACHE_INVALID, &cache_replace->cache_flags);
+                    clear_bit(CACHE_UPTODATE, &cache_replace->cache_flags);
+                    set_bit(CACHE_LOCKED, &cache_replace->cache_flags);
+
+                    cache_replace->lba_align = lba_align;
+
+                    write_lock_irq(&radix_tree_lock);
+                    insert_cache_in_tree(cache_tree_root, 
+                            cache_replace->lba_align, cache_replace);
+                    write_unlock_irq(&radix_tree_lock);
+
+                    pg = cache_replace->page;
+                    off = 0;
+
+                }
+                else
+                {
+                    struct page page_new = alloc_page(GFP_KERNEL);
+                    if (!page_new)
+                        printk("page alloc Failed");
+                    vdisk_cache *cache_new = alloc_cache_struct(lba_align, page_new);
+
+                    set_bit(CACHE_INVALID, &cache_new->cache_flags);
+                    clear_bit(CACHE_UPTODATE, &cache_new->cache_flags);
+                    set_bit(CACHE_LOCKED, &cache_new->cache_flags);
+
+                    pg = cache_new->page;
+                    off = 0;
+                    atomic_inc(&cache_size);
+
+                }
+
+                if (need_new_bio) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 30)
+                    bio = bio_kmalloc(gfp_mask, max_nr_vecs);
+#else
+                    bio = bio_alloc(gfp_mask, max_nr_vecs);
+#endif
+                    if (!bio) {
+                        PRINT_ERROR("Failed to create bio "
+                                "for data segment %d (cmd %p)",
+                                cmd->get_sg_buf_entry_num, cmd);
+                        goto out_no_bio;
+                    }
+
+                    bios++;
+                    need_new_bio = 0;
+                    bio->bi_end_io = blockio_endio;
+                    bio->bi_sector = lba_start0 <<
+                        (virt_dev->block_shift - 9);
+                    bio->bi_bdev = bdev;
+                    bio->bi_private = blockio_work;
+
+                    block_work->sgl = cmd->sg[cmd->get_sg_buf_entry_num - 1];
+                    block_work->off = cache_offset << SECTOR_SIZE;
+                    block_work->len = length;        
+                    /*
+                     * Better to fail fast w/o any local recovery
+                     * and retries.
+                     */
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 27)
+                    bio->bi_rw |= (1 << BIO_RW_FAILFAST);
+#elif LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 35)
+                    bio->bi_rw |= (1 << BIO_RW_FAILFAST_DEV) |
+                        (1 << BIO_RW_FAILFAST_TRANSPORT) |
+                        (1 << BIO_RW_FAILFAST_DRIVER);
+#else
+                    bio->bi_rw |= REQ_FAILFAST_DEV |
+                        REQ_FAILFAST_TRANSPORT |
+                        REQ_FAILFAST_DRIVER;
+#endif
+#if 0 /* It could be win, but could be not, so a performance study is needed */
+                    bio->bi_rw |= REQ_SYNC;
+#endif
+                    if (!hbio)
+                        hbio = tbio = bio;
+                    else
+                        tbio = tbio->bi_next = bio;
+                }
+
+                //bytes = min_t(unsigned int, len, PAGE_SIZE - off);
+                bytes = min_t(unsigned int, len, 
+                        (SECTS_OF_PAGE - cache_offset) << SECTOR_SIZE);
+
+                //bio中加入整个Cache块页，从磁盘读取整个Cache块数据
+                rc = bio_add_page(bio, pg, PAGE_SIZE, 0);
+                if (bytes < len) {
+                    sBUG_ON(rc != 0);
+                    need_new_bio = 1;
+                    lba_start0 += bytes >> virt_dev->block_shift;
+                    thislen = 0;
+                    continue;
+                }
+
+                //pg++;
+                //thislen += bytes;
+                len -= bytes;
+                //off = 0;
+
+            }
+
+        }
+
+        lba_start += length >> virt_dev->block_shift;
+
+        scst_put_sg_page(cmd, page, offset);
+        length = scst_get_sg_page_next(cmd, &page, &offset);
+    }
+
+    /* +1 to prevent erroneous too early command completion */
+    atomic_set(&blockio_work->bios_inflight, bios+1);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+    blk_start_plug(&plug);
+#endif
+
+    while (hbio) {
+        bio = hbio;
+        hbio = hbio->bi_next;
+        bio->bi_next = NULL;
+        submit_bio((write != 0), bio);
+    }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+    blk_finish_plug(&plug);
+#else
+    if (q && q->unplug_fn)
+        q->unplug_fn(q);
+#endif
+
+    blockio_check_finish(blockio_work);
+
+out:
+    TRACE_EXIT();
+    return;
+
+out_no_bio:
+    while (hbio) {
+        bio = hbio;
+        hbio = hbio->bi_next;
+        bio_put(bio);
+    }
+    kmem_cache_free(blockio_work_cachep, blockio_work);
+
+out_no_mem:
+    scst_set_busy(cmd);
+    goto out;
+}
+
+//added by vic
+static void blockio_data_read(struct scst_cmd *cmd, struct scst_vdisk_thr *thr,
+        u64 lba_start, int write)
+{
     //利用lba_align在基树上进行检索
     //如果命中，拷贝Cache块数据
     //如果不命中，构造bio入bio链
@@ -3432,8 +3687,235 @@ out_no_mem:
     scst_set_busy(cmd);
     goto out;
 }
+//added by vic
+static void blockio_exec_write(struct scst_cmd *cmd, struct scst_vdisk_thr *thr,
+        u64 lba_start, int write)
+{
+    //利用lba_align在基树上进行检索
+    //如果命中，向Cache块拷贝数据
+    //如果不命中，构造bio入bio链
+    struct scst_vdisk_dev *virt_dev = cmd->dev->dh_priv;
+    struct block_device *bdev = thr->bdev;
+    struct request_queue *q = bdev_get_queue(bdev);
+    int length, max_nr_vecs = 0, offset;
+    struct page *page;
+    struct bio *bio = NULL, *hbio = NULL, *tbio = NULL;
+    int need_new_bio;
+    struct scst_blockio_work *blockio_work;
+    int bios = 0;
+    gfp_t gfp_mask = (cmd->noio_mem_alloc ? GFP_NOIO : GFP_KERNEL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+    struct blk_plug plug;
+#endif
+
+    TRACE_ENTRY();
+
+    if (virt_dev->nullio)
+        goto out;
+
+    /* Allocate and initialize blockio_work struct */
+    blockio_work = kmem_cache_alloc(blockio_work_cachep, gfp_mask);
+    if (blockio_work == NULL)
+        goto out_no_mem;
+
+    blockio_work->cmd = cmd;
+
+    if (q)
+        max_nr_vecs = min(bio_get_nr_vecs(bdev), BIO_MAX_PAGES);
+    else
+        max_nr_vecs = 1;
 
 
+    length = scst_get_sg_page_first(cmd, &page, &offset);
+    while (length > 0) {
+        int len, bytes, off, thislen;
+        struct page *pg;
+        u64 lba_start0;
+        u32 lba_align, cache_offset;      //Cache块地址lba_align及块内偏移cache_offset
+
+        pg = page;
+        len = length;
+        off = offset;
+        //thislen = 0;
+        lba_start0 = lba_start;
+
+        while (len > 0) {
+            int rc;
+
+            //基树上检索
+            lba_align = lba_start0 >> SECTS_OF_PAGE;
+            cache_offset = lba_start0 & (SECTS_OF_PAGE - 1);
+            write_lock_irq(&radix_tree_lock);
+            cache_hitted = lookup_cache_in_tree(cache_tree_root, lba_align);
+            write_unlock_irq(&radix_tree_lock);
+
+            //命中Cache
+            if (cache_hitted && !test_bit(CACHE_LOCKED, &cache_hitted->cache_flags))
+            {
+                memcpy(page_address(pg), page_address(cache_hitted->page) 
+                        + (lba_offset >> SECTOR_SIZE), len);
+            }
+            else
+            {
+                need_new_bio = 1;
+
+                //先判断Cache是否满
+                //满则置换，未满则直接新增Cache
+                if (is_cache_full(cache_size))
+                {
+                    write_lock_irq(&radix_tree_lock);
+                    radix_tree_node * cache_replace = lookup_min_in_tree(cache_tree_root);
+                    delete_cache_in_tree(cache_tree_root, cache_replace->lba_align);
+                    write_unlock_irq(&radix_tree_lock);
+
+                    set_bit(CACHE_INVALID, &cache_replace->cache_flags);
+                    clear_bit(CACHE_UPTODATE, &cache_replace->cache_flags);
+                    set_bit(CACHE_LOCKED, &cache_replace->cache_flags);
+
+                    cache_replace->lba_align = lba_align;
+
+                    write_lock_irq(&radix_tree_lock);
+                    insert_cache_in_tree(cache_tree_root, 
+                            cache_replace->lba_align, cache_replace);
+                    write_unlock_irq(&radix_tree_lock);
+
+                    pg = cache_replace->page;
+                    off = 0;
+
+                }
+                else
+                {
+                    struct page page_new = alloc_page(GFP_KERNEL);
+                    if (!page_new)
+                        printk("page alloc Failed");
+                    vdisk_cache *cache_new = alloc_cache_struct(lba_align, page_new);
+
+                    set_bit(CACHE_INVALID, &cache_new->cache_flags);
+                    clear_bit(CACHE_UPTODATE, &cache_new->cache_flags);
+                    set_bit(CACHE_LOCKED, &cache_new->cache_flags);
+
+                    pg = cache_new->page;
+                    off = 0;
+                    atomic_inc(&cache_size);
+
+                }
+
+                if (need_new_bio) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 30)
+                    bio = bio_kmalloc(gfp_mask, max_nr_vecs);
+#else
+                    bio = bio_alloc(gfp_mask, max_nr_vecs);
+#endif
+                    if (!bio) {
+                        PRINT_ERROR("Failed to create bio "
+                                "for data segment %d (cmd %p)",
+                                cmd->get_sg_buf_entry_num, cmd);
+                        goto out_no_bio;
+                    }
+
+                    bios++;
+                    need_new_bio = 0;
+                    bio->bi_end_io = blockio_endio;
+                    bio->bi_sector = lba_start0 <<
+                        (virt_dev->block_shift - 9);
+                    bio->bi_bdev = bdev;
+                    bio->bi_private = blockio_work;
+
+                    block_work->sgl = cmd->sg[cmd->get_sg_buf_entry_num - 1];
+                    block_work->off = cache_offset << SECTOR_SIZE;
+                    block_work->len = length;        
+                    /*
+                     * Better to fail fast w/o any local recovery
+                     * and retries.
+                     */
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 27)
+                    bio->bi_rw |= (1 << BIO_RW_FAILFAST);
+#elif LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 35)
+                    bio->bi_rw |= (1 << BIO_RW_FAILFAST_DEV) |
+                        (1 << BIO_RW_FAILFAST_TRANSPORT) |
+                        (1 << BIO_RW_FAILFAST_DRIVER);
+#else
+                    bio->bi_rw |= REQ_FAILFAST_DEV |
+                        REQ_FAILFAST_TRANSPORT |
+                        REQ_FAILFAST_DRIVER;
+#endif
+#if 0 /* It could be win, but could be not, so a performance study is needed */
+                    bio->bi_rw |= REQ_SYNC;
+#endif
+                    if (!hbio)
+                        hbio = tbio = bio;
+                    else
+                        tbio = tbio->bi_next = bio;
+                }
+
+                //bytes = min_t(unsigned int, len, PAGE_SIZE - off);
+                bytes = min_t(unsigned int, len, 
+                        (SECTS_OF_PAGE - cache_offset) << SECTOR_SIZE);
+
+                //bio中加入整个Cache块页，从磁盘读取整个Cache块数据
+                rc = bio_add_page(bio, pg, PAGE_SIZE, 0);
+                if (bytes < len) {
+                    sBUG_ON(rc != 0);
+                    need_new_bio = 1;
+                    lba_start0 += bytes >> virt_dev->block_shift;
+                    thislen = 0;
+                    continue;
+                }
+
+                //pg++;
+                //thislen += bytes;
+                len -= bytes;
+                //off = 0;
+
+            }
+
+        }
+
+        lba_start += length >> virt_dev->block_shift;
+
+        scst_put_sg_page(cmd, page, offset);
+        length = scst_get_sg_page_next(cmd, &page, &offset);
+    }
+
+    /* +1 to prevent erroneous too early command completion */
+    atomic_set(&blockio_work->bios_inflight, bios+1);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+    blk_start_plug(&plug);
+#endif
+
+    while (hbio) {
+        bio = hbio;
+        hbio = hbio->bi_next;
+        bio->bi_next = NULL;
+        submit_bio((write != 0), bio);
+    }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39)
+    blk_finish_plug(&plug);
+#else
+    if (q && q->unplug_fn)
+        q->unplug_fn(q);
+#endif
+
+    blockio_check_finish(blockio_work);
+
+out:
+    TRACE_EXIT();
+    return;
+
+out_no_bio:
+    while (hbio) {
+        bio = hbio;
+        hbio = hbio->bi_next;
+        bio_put(bio);
+    }
+    kmem_cache_free(blockio_work_cachep, blockio_work);
+
+out_no_mem:
+    scst_set_busy(cmd);
+    goto out;
+}
 
 static int vdisk_blockio_flush(struct block_device *bdev, gfp_t gfp_mask,
         bool report_error)
